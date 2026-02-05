@@ -22,28 +22,39 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
 }
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
 
-def safe_get(url, timeout=30, tries=3, sleep_base=1.2):
+def safe_get(url, timeout=30, tries=4, sleep_base=1.5):
     last_err = None
     for i in range(tries):
         try:
             r = session.get(url, timeout=timeout)
+            # Si hay bloqueo temporal, reintentar con backoff
+            if r.status_code in (403, 429, 503):
+                last_err = RuntimeError(f"HTTP {r.status_code} al pedir {url}")
+                time.sleep(sleep_base * (i + 1) + random.uniform(0.2, 0.8))
+                continue
+
             r.raise_for_status()
             return r
-        except Exception:
-            time.sleep(sleep_base * (i + 1))
-    raise last_err
+
+        except Exception as e:
+            last_err = e
+            time.sleep(sleep_base * (i + 1) + random.uniform(0.2, 0.8))
+
+    raise RuntimeError(f"No fue posible obtener la URL tras {tries} intentos: {url}. Último error: {last_err}")
 
 
 def normalize_url(u: str):
     if not u:
         return None
-    u, _ = urldefrag(u)
+    u, _ = urldefrag(u)  # quita fragmento #/variantes
     return u.strip()
 
 
@@ -71,10 +82,9 @@ def build_page_url(page_num: int):
 
 
 def get_listing_scope(soup: BeautifulSoup):
+    # SOLO listado principal (omite módulos como “Los más vendidos”)
     scope = soup.select_one("#js-product-list")
-    if scope:
-        return scope
-    return soup
+    return scope if scope else soup
 
 
 def parse_listing_page(page_url, page_num, extraction_ts):
@@ -92,23 +102,32 @@ def parse_listing_page(page_url, page_num, extraction_ts):
         if not a:
             continue
 
+        name = a.get_text(" ", strip=True)
+        product_url = normalize_url(a.get("href"))
+
+        brand_a = card.select_one("h6.product-brand a")
+        laboratorio = brand_a.get_text(" ", strip=True) if brand_a else None
+
+        price_el = card.select_one('span.price[itemprop="price"], span.price')
+        price = parse_price(price_el.get_text(" ", strip=True)) if price_el else None
+
+        pum_el = card.select_one("span.pum")
+        pum = pum_el.get_text(" ", strip=True) if pum_el else None
+
+        img = card.select_one("img")
+        img_url = img.get("src") if img else None
+        img_url_large = img.get("data-full-size-image-url") if img else None
+
         items.append({
-            "Nombre producto": a.get_text(" ", strip=True),
-            "Laboratorio": (
-                card.select_one("h6.product-brand a").get_text(" ", strip=True)
-                if card.select_one("h6.product-brand a") else None
-            ),
-            "Precio": parse_price(
-                card.select_one("span.price").get_text(" ", strip=True)
-                if card.select_one("span.price") else None
-            ),
-            "PUM": (
-                card.select_one("span.pum").get_text(" ", strip=True)
-                if card.select_one("span.pum") else None
-            ),
+            "Nombre producto": name,
+            "Laboratorio": laboratorio,
+            "Precio": price,
+            "PUM": pum,
             "Página": page_num,
             "FechaHoraExtracción": extraction_ts,
-            "Link producto": normalize_url(a.get("href")),
+            "Link producto": product_url,
+            "Link imagen": img_url,
+            "Link imagen grande": img_url_large,
         })
 
     return items, total_products
@@ -123,16 +142,26 @@ def main():
     out_dir = f"outputs/Nutricion/{yyyy}/{mm}/{dd}"
     os.makedirs(out_dir, exist_ok=True)
 
-    first_items, total_products = parse_listing_page(build_page_url(1), 1, extraction_ts)
-    total_pages = math.ceil(total_products / PAGE_SIZE)
+    print("Iniciando extracción:", extraction_ts, "TZ:", TZ_COL)
 
-    all_items = first_items[:]
+    first_items, total_products = parse_listing_page(build_page_url(1), 1, extraction_ts)
+    if not total_products:
+        raise RuntimeError("No se pudo detectar el total de productos (div.pagination-info). Posible cambio de HTML.")
+
+    total_pages = math.ceil(total_products / PAGE_SIZE)
+    print("Total reportado por web:", total_products, "| Páginas:", total_pages)
+
+    all_items = list(first_items)
+
     for p in range(2, total_pages + 1):
         items, _ = parse_listing_page(build_page_url(p), p, extraction_ts)
         all_items.extend(items)
-        time.sleep(random.uniform(0.3, 0.8))
+        time.sleep(random.uniform(0.25, 0.8))
 
-    df = pd.DataFrame(all_items).drop_duplicates(subset=["Link producto"])
+    df = pd.DataFrame(all_items)
+
+    # Deduplicación por URL normalizada
+    df = df.drop_duplicates(subset=["Link producto"], keep="first").reset_index(drop=True)
 
     csv = f"{out_dir}/drogueriascafam_nutricion_{timestamp}.csv"
     xlsx = f"{out_dir}/drogueriascafam_nutricion_{timestamp}.xlsx"
@@ -140,6 +169,9 @@ def main():
     df.to_csv(csv, index=False, sep=";")
     df.to_excel(xlsx, index=False)
 
+    print("Productos únicos:", df["Link producto"].nunique())
+    print("Filas DF:", len(df))
+    print("Laboratorios nulos:", int(df["Laboratorio"].isna().sum()))
     print("CSV:", csv)
     print("XLSX:", xlsx)
 
