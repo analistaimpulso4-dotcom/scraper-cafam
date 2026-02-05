@@ -1,12 +1,13 @@
 # ==========================================
 # Scraper Droguerías Cafam - Nutrición
-# Para ejecutar en GitHub Actions (cron) o local.
-# - Extrae SOLO el listado principal (#js-product-list) para omitir módulos como:
-#   "Los mas vendidos de la categoría" (fmlrecs) que generan duplicados.
-# - Extrae: Nombre producto, Laboratorio (desde listado), Precio, PUM,
+# ✅ Diseñado para GitHub Actions (cron) o ejecución local.
+# ✅ Extrae SOLO listado principal (#js-product-list) para omitir módulos como:
+#    "Los mas vendidos de la categoría" (fmlrecs) que generan duplicados.
+# ✅ Extrae: Nombre producto, Laboratorio (desde listado), Precio, PUM,
 #           Página, FechaHoraExtracción (hora Colombia), links e imágenes.
-# - Deduplica por Link producto (normaliza quitando #/variantes).
-# - Exporta CSV (separador ;) y XLSX en outputs/Nutricion/YYYY/MM/DD/
+# ✅ Deduplica por Link producto (normaliza quitando #/variantes).
+# ✅ Exporta CSV (separador ;) y XLSX en outputs/Nutricion/YYYY/MM/DD/
+# ✅ safe_get corregido: NUNCA hace "raise last_err"
 # ==========================================
 
 import os
@@ -22,10 +23,10 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
+
 # ---------------- CONFIG ----------------
 BASE_URL = "https://www.drogueriascafam.com.co/38-nutricion"
 PAGE_SIZE = 12
-
 TZ_COL = pytz.timezone("America/Bogota")
 
 HEADERS = {
@@ -42,11 +43,12 @@ HEADERS = {
 session = requests.Session()
 session.headers.update(HEADERS)
 
+
 # ---------------- HELPERS ----------------
 def safe_get(url, timeout=30, tries=4, sleep_base=1.5):
     """
     GET con reintentos y backoff.
-    ✅ Nunca hace 'raise None' (evita el error: exceptions must derive from BaseException).
+    ✅ Nunca lanza 'raise None' (evita: exceptions must derive from BaseException).
     """
     last_err = None
 
@@ -68,9 +70,11 @@ def safe_get(url, timeout=30, tries=4, sleep_base=1.5):
             last_err = e
             time.sleep(sleep_base * (i + 1) + random.uniform(0.2, 0.8))
 
+    # ✅ Nunca "raise last_err"
     raise RuntimeError(
         f"No fue posible obtener la URL tras {tries} intentos: {url}. Último error: {repr(last_err)}"
     )
+
 
 def normalize_url(u: str):
     """Quita fragmentos tipo #/2-vector-xxxx (variantes) para evitar duplicados."""
@@ -79,9 +83,10 @@ def normalize_url(u: str):
     u, _ = urldefrag(u)
     return u.strip()
 
+
 def parse_total_products(soup: BeautifulSoup):
     """
-    Busca texto como:
+    Busca:
       'Mostrando 1-12 de 209 artículo(s)'
     """
     info = soup.select_one("div.pagination-info")
@@ -93,6 +98,7 @@ def parse_total_products(soup: BeautifulSoup):
         return int(m.group(1).replace(".", ""))
     return None
 
+
 def parse_price(text):
     if not text:
         return None
@@ -101,19 +107,23 @@ def parse_price(text):
     t = re.sub(r"\s+", " ", t)
     return t
 
+
 def build_page_url(page_num: int):
     return BASE_URL if page_num == 1 else f"{BASE_URL}?page={page_num}"
 
+
 def get_listing_scope(soup: BeautifulSoup):
     """
-    ✅ SOLO listado principal para omitir módulos (ej: fmlrecs "Los más vendidos")
+    ✅ SOLO listado principal para omitir módulos extra (fmlrecs / más vendidos).
     """
     scope = soup.select_one("#js-product-list")
     if scope:
         return scope
-    # Fallbacks por si cambia el HTML
+
+    # Fallbacks si cambia el HTML
     scope = soup.select_one("main") or soup.select_one("#content-wrapper")
     return scope if scope else soup
+
 
 def parse_listing_page(page_url, page_num, extraction_ts):
     r = safe_get(page_url)
@@ -166,6 +176,7 @@ def parse_listing_page(page_url, page_num, extraction_ts):
 
     return items, total_products
 
+
 # ---------------- MAIN ----------------
 def main():
     # ✅ Hora Colombia
@@ -181,14 +192,15 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"✅ Inicio extracción: {extraction_ts} (America/Bogota)")
+    print("✅ URL base:", BASE_URL)
 
     # Página 1 para leer total
     first_items, total_products = parse_listing_page(build_page_url(1), 1, extraction_ts)
     if not total_products:
-        raise RuntimeError("No pude leer el total de productos (div.pagination-info). Posible cambio de HTML.")
+        raise RuntimeError("No pude leer el total de productos (div.pagination-info). Posible cambio de HTML / bloqueo.")
 
     total_pages = math.ceil(total_products / PAGE_SIZE)
-    print(f"Total reportado por la web: {total_products} | Páginas: {total_pages}")
+    print(f"✅ Total reportado por la web: {total_products} | Páginas: {total_pages}")
 
     all_items = []
     all_items.extend(first_items)
@@ -215,6 +227,7 @@ def main():
     print("✅ Laboratorios nulos:", int(df["Laboratorio"].isna().sum()))
     print("📄 CSV :", csv_path)
     print("📗 XLSX:", xlsx_path)
+
 
 if __name__ == "__main__":
     main()
