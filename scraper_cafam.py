@@ -1,3 +1,14 @@
+# ==========================================
+# Scraper Droguerías Cafam - Nutrición
+# Para ejecutar en GitHub Actions (cron) o local.
+# - Extrae SOLO el listado principal (#js-product-list) para omitir módulos como:
+#   "Los mas vendidos de la categoría" (fmlrecs) que generan duplicados.
+# - Extrae: Nombre producto, Laboratorio (desde listado), Precio, PUM,
+#           Página, FechaHoraExtracción (hora Colombia), links e imágenes.
+# - Deduplica por Link producto (normaliza quitando #/variantes).
+# - Exporta CSV (separador ;) y XLSX en outputs/Nutricion/YYYY/MM/DD/
+# ==========================================
+
 import os
 import math
 import time
@@ -11,8 +22,10 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
+# ---------------- CONFIG ----------------
 BASE_URL = "https://www.drogueriascafam.com.co/38-nutricion"
 PAGE_SIZE = 12
+
 TZ_COL = pytz.timezone("America/Bogota")
 
 HEADERS = {
@@ -29,14 +42,21 @@ HEADERS = {
 session = requests.Session()
 session.headers.update(HEADERS)
 
-
+# ---------------- HELPERS ----------------
 def safe_get(url, timeout=30, tries=4, sleep_base=1.5):
+    """
+    GET con reintentos y backoff.
+    ✅ Nunca hace 'raise None' (evita el error: exceptions must derive from BaseException).
+    """
     last_err = None
+
     for i in range(tries):
         try:
             r = session.get(url, timeout=timeout)
-            # Si hay bloqueo temporal, reintentar con backoff
+
+            # Códigos típicos de bloqueo / rate-limit / servicio no disponible
             if r.status_code in (403, 429, 503):
+                print(f"⚠️ HTTP {r.status_code} intento {i+1}/{tries} -> {url}")
                 last_err = RuntimeError(f"HTTP {r.status_code} al pedir {url}")
                 time.sleep(sleep_base * (i + 1) + random.uniform(0.2, 0.8))
                 continue
@@ -48,17 +68,22 @@ def safe_get(url, timeout=30, tries=4, sleep_base=1.5):
             last_err = e
             time.sleep(sleep_base * (i + 1) + random.uniform(0.2, 0.8))
 
-    raise RuntimeError(f"No fue posible obtener la URL tras {tries} intentos: {url}. Último error: {last_err}")
-
+    raise RuntimeError(
+        f"No fue posible obtener la URL tras {tries} intentos: {url}. Último error: {repr(last_err)}"
+    )
 
 def normalize_url(u: str):
+    """Quita fragmentos tipo #/2-vector-xxxx (variantes) para evitar duplicados."""
     if not u:
         return None
-    u, _ = urldefrag(u)  # quita fragmento #/variantes
+    u, _ = urldefrag(u)
     return u.strip()
 
-
 def parse_total_products(soup: BeautifulSoup):
+    """
+    Busca texto como:
+      'Mostrando 1-12 de 209 artículo(s)'
+    """
     info = soup.select_one("div.pagination-info")
     if not info:
         return None
@@ -68,24 +93,27 @@ def parse_total_products(soup: BeautifulSoup):
         return int(m.group(1).replace(".", ""))
     return None
 
-
 def parse_price(text):
     if not text:
         return None
     t = text.replace("\xa0", " ").strip()
     t = t.replace("$", "").strip()
-    return re.sub(r"\s+", " ", t)
-
+    t = re.sub(r"\s+", " ", t)
+    return t
 
 def build_page_url(page_num: int):
     return BASE_URL if page_num == 1 else f"{BASE_URL}?page={page_num}"
 
-
 def get_listing_scope(soup: BeautifulSoup):
-    # SOLO listado principal (omite módulos como “Los más vendidos”)
+    """
+    ✅ SOLO listado principal para omitir módulos (ej: fmlrecs "Los más vendidos")
+    """
     scope = soup.select_one("#js-product-list")
+    if scope:
+        return scope
+    # Fallbacks por si cambia el HTML
+    scope = soup.select_one("main") or soup.select_one("#content-wrapper")
     return scope if scope else soup
-
 
 def parse_listing_page(page_url, page_num, extraction_ts):
     r = safe_get(page_url)
@@ -94,10 +122,11 @@ def parse_listing_page(page_url, page_num, extraction_ts):
     total_products = parse_total_products(soup)
     scope = get_listing_scope(soup)
 
-    cards = scope.select("article.product-miniature, div.product-miniature")
+    product_cards = scope.select("article.product-miniature, div.product-miniature")
 
     items = []
-    for card in cards:
+    for card in product_cards:
+        # Nombre + link producto
         a = card.select_one("h2.product-title a")
         if not a:
             continue
@@ -105,15 +134,20 @@ def parse_listing_page(page_url, page_num, extraction_ts):
         name = a.get_text(" ", strip=True)
         product_url = normalize_url(a.get("href"))
 
+        # Laboratorio desde listado:
+        # <h6 class="product-brand ..."><a ...>ABBOTT ...</a></h6>
         brand_a = card.select_one("h6.product-brand a")
         laboratorio = brand_a.get_text(" ", strip=True) if brand_a else None
 
+        # Precio
         price_el = card.select_one('span.price[itemprop="price"], span.price')
         price = parse_price(price_el.get_text(" ", strip=True)) if price_el else None
 
+        # PUM
         pum_el = card.select_one("span.pum")
         pum = pum_el.get_text(" ", strip=True) if pum_el else None
 
+        # Imagen
         img = card.select_one("img")
         img_url = img.get("src") if img else None
         img_url_large = img.get("data-full-size-image-url") if img else None
@@ -132,49 +166,55 @@ def parse_listing_page(page_url, page_num, extraction_ts):
 
     return items, total_products
 
-
+# ---------------- MAIN ----------------
 def main():
+    # ✅ Hora Colombia
     extraction_dt = datetime.now(TZ_COL)
     extraction_ts = extraction_dt.strftime("%Y-%m-%d %H:%M:%S")
-    timestamp = extraction_dt.strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp_file = extraction_dt.strftime("%Y-%m-%d_%H-%M-%S")
 
-    yyyy, mm, dd = extraction_dt.strftime("%Y"), extraction_dt.strftime("%m"), extraction_dt.strftime("%d")
-    out_dir = f"outputs/Nutricion/{yyyy}/{mm}/{dd}"
+    yyyy = extraction_dt.strftime("%Y")
+    mm = extraction_dt.strftime("%m")
+    dd = extraction_dt.strftime("%d")
+
+    out_dir = os.path.join("outputs", "Nutricion", yyyy, mm, dd)
     os.makedirs(out_dir, exist_ok=True)
 
-    print("Iniciando extracción:", extraction_ts, "TZ:", TZ_COL)
+    print(f"✅ Inicio extracción: {extraction_ts} (America/Bogota)")
 
+    # Página 1 para leer total
     first_items, total_products = parse_listing_page(build_page_url(1), 1, extraction_ts)
     if not total_products:
-        raise RuntimeError("No se pudo detectar el total de productos (div.pagination-info). Posible cambio de HTML.")
+        raise RuntimeError("No pude leer el total de productos (div.pagination-info). Posible cambio de HTML.")
 
     total_pages = math.ceil(total_products / PAGE_SIZE)
-    print("Total reportado por web:", total_products, "| Páginas:", total_pages)
+    print(f"Total reportado por la web: {total_products} | Páginas: {total_pages}")
 
-    all_items = list(first_items)
+    all_items = []
+    all_items.extend(first_items)
 
     for p in range(2, total_pages + 1):
-        items, _ = parse_listing_page(build_page_url(p), p, extraction_ts)
+        url = build_page_url(p)
+        items, _ = parse_listing_page(url, p, extraction_ts)
         all_items.extend(items)
         time.sleep(random.uniform(0.25, 0.8))
 
     df = pd.DataFrame(all_items)
 
-    # Deduplicación por URL normalizada
+    # Deduplicación por URL del producto (ya normalizada)
     df = df.drop_duplicates(subset=["Link producto"], keep="first").reset_index(drop=True)
 
-    csv = f"{out_dir}/drogueriascafam_nutricion_{timestamp}.csv"
-    xlsx = f"{out_dir}/drogueriascafam_nutricion_{timestamp}.xlsx"
+    csv_path = os.path.join(out_dir, f"drogueriascafam_nutricion_{timestamp_file}.csv")
+    xlsx_path = os.path.join(out_dir, f"drogueriascafam_nutricion_{timestamp_file}.xlsx")
 
-    df.to_csv(csv, index=False, sep=";")
-    df.to_excel(xlsx, index=False)
+    df.to_csv(csv_path, index=False, sep=";")
+    df.to_excel(xlsx_path, index=False)
 
-    print("Productos únicos:", df["Link producto"].nunique())
-    print("Filas DF:", len(df))
-    print("Laboratorios nulos:", int(df["Laboratorio"].isna().sum()))
-    print("CSV:", csv)
-    print("XLSX:", xlsx)
-
+    print("✅ Productos únicos:", df["Link producto"].nunique())
+    print("✅ Filas DF:", len(df))
+    print("✅ Laboratorios nulos:", int(df["Laboratorio"].isna().sum()))
+    print("📄 CSV :", csv_path)
+    print("📗 XLSX:", xlsx_path)
 
 if __name__ == "__main__":
     main()
