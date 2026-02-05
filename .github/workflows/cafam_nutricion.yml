@@ -1,0 +1,31 @@
+name: Cafam Nutricion Scraper
+
+on:
+  schedule:
+    # Colombia UTC-5 → sumar 5 horas
+    - cron: "0 12 * * *"  # 07:00 COL
+    - cron: "0 17 * * *"  # 12:00 COL
+    - cron: "0 23 * * *"  # 18:00 COL
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python scraper_cafam.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: cafam_nutricion_outputs
+          path: outputs/
